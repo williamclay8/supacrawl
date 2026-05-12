@@ -3,6 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -88,6 +91,125 @@ func TestDiffCommandJSON(t *testing.T) {
 	require.Contains(t, stdout.String(), `"project_mismatch": false`)
 	require.Contains(t, stdout.String(), `"changed_fields": [`)
 	require.Contains(t, stdout.String(), `"rls_enabled"`)
+}
+
+func TestAuditCommandJSON(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "supacrawl.db")
+	var stdout bytes.Buffer
+	app := &App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+
+	require.NoError(t, app.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath, "--project-id", "demo"}))
+	stdout.Reset()
+	st, err := store.Open(dbPath)
+	require.NoError(t, err)
+	require.NoError(t, st.PutSnapshot(ctx, postgres.Snapshot{
+		Project: postgres.ProjectInfo{ID: "demo", DatabaseName: "postgres", CurrentUser: "postgres", ServerVersion: "16.0", CollectedAt: time.Now().UTC()},
+		Tables:  []postgres.Table{{Schema: "public", Name: "profiles", Kind: "table", Owner: "postgres", RLSEnabled: false}},
+	}))
+	require.NoError(t, st.Close())
+
+	require.NoError(t, app.Run(ctx, []string{"--config", configPath, "audit", "--json", "--sync", "never"}))
+	require.Contains(t, stdout.String(), `"tables_without_rls"`)
+	require.Contains(t, stdout.String(), `"profiles"`)
+}
+
+func TestContextCommandJSON(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "supacrawl.db")
+	var stdout bytes.Buffer
+	app := &App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+
+	require.NoError(t, app.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath, "--project-id", "demo"}))
+	stdout.Reset()
+
+	require.NoError(t, app.Run(ctx, []string{"--config", configPath, "context", "--json", "--sync", "never"}))
+	require.Contains(t, stdout.String(), `"status"`)
+	require.Contains(t, stdout.String(), `"audit"`)
+	require.Contains(t, stdout.String(), `"management"`)
+}
+
+func TestManagementSyncStoresSnapshot(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "supacrawl.db")
+	var stdout bytes.Buffer
+	app := &App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	t.Setenv("SUPABASE_ACCESS_TOKEN_TEST", "test-token")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/projects/abcdefghijklmnopqrst/functions":
+			_, _ = w.Write([]byte(`[{"slug":"hello"}]`))
+		case "/v1/projects/abcdefghijklmnopqrst/branches":
+			_, _ = w.Write([]byte(`[{"name":"main"}]`))
+		case "/v1/projects/abcdefghijklmnopqrst/secrets":
+			_, _ = w.Write([]byte(`[{"name":"API_TOKEN","value":"must-not-persist"}]`))
+		case "/v1/projects/abcdefghijklmnopqrst/config/auth":
+			_, _ = w.Write([]byte(`{"site_url":"https://example.test"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	require.NoError(t, app.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}))
+	stdout.Reset()
+	require.NoError(t, app.Run(ctx, []string{
+		"--config", configPath,
+		"management", "sync",
+		"--project-ref", "abcdefghijklmnopqrst",
+		"--api-url", server.URL,
+		"--token-env", "SUPABASE_ACCESS_TOKEN_TEST",
+		"--json",
+	}))
+	require.Contains(t, stdout.String(), `"project_ref": "abcdefghijklmnopqrst"`)
+	require.NotContains(t, stdout.String(), "must-not-persist")
+
+	st, err := store.Open(dbPath)
+	require.NoError(t, err)
+	defer st.Close()
+	latest, err := st.LatestManagementSnapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "abcdefghijklmnopqrst", latest.ProjectRef)
+	require.NotContains(t, string(latest.RawJSON), "must-not-persist")
+}
+
+func TestDriftCommandIncludesArchiveAuditAndBranchInventory(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	currentPath := filepath.Join(dir, "current.db")
+	baselinePath := filepath.Join(dir, "baseline.db")
+	var stdout bytes.Buffer
+	app := &App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+
+	require.NoError(t, app.Run(ctx, []string{"--config", configPath, "init", "--db", currentPath, "--project-id", "demo"}))
+	writeTestSnapshot(t, baselinePath, true)
+	writeTestSnapshot(t, currentPath, false)
+	st, err := store.Open(currentPath)
+	require.NoError(t, err)
+	_, err = st.PutManagementSnapshot(ctx, "management-api", "abcdefghijklmnopqrst", []byte(`{
+		"project_ref":"abcdefghijklmnopqrst",
+		"branches":{"available":true,"raw":[{"name":"main"},{"name":"preview"}]}
+	}`))
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+	stdout.Reset()
+
+	require.NoError(t, app.Run(ctx, []string{"--config", configPath, "drift", baselinePath, "--json", "--sync", "never"}))
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &payload))
+	require.Contains(t, payload, "diff")
+	require.Contains(t, payload, "audit")
+	require.Contains(t, payload, "branches")
 }
 
 func TestDataProgressWritesToStderr(t *testing.T) {

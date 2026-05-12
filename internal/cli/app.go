@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -10,12 +11,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/davemorin/supacrawl/internal/backup"
 	"github.com/davemorin/supacrawl/internal/config"
+	"github.com/davemorin/supacrawl/internal/management"
 	"github.com/davemorin/supacrawl/internal/postgres"
 	"github.com/davemorin/supacrawl/internal/storage"
 	"github.com/davemorin/supacrawl/internal/store"
@@ -88,6 +91,12 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runReport(ctx, *configPath, rest[1:], outputFormat)
 	case "diff":
 		return a.runDiff(ctx, *configPath, rest[1:], outputFormat)
+	case "drift":
+		return a.runDrift(ctx, *configPath, rest[1:], outputFormat)
+	case "audit":
+		return a.runAudit(ctx, *configPath, rest[1:], outputFormat)
+	case "context":
+		return a.runContextPack(ctx, *configPath, rest[1:], outputFormat)
 	case "search":
 		return a.runSearch(ctx, *configPath, rest[1:], outputFormat)
 	case "sql":
@@ -100,6 +109,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runStorage(ctx, *configPath, rest[1:], outputFormat)
 	case "backup":
 		return a.runBackup(ctx, *configPath, rest[1:], outputFormat)
+	case "management":
+		return a.runManagement(ctx, *configPath, rest[1:], outputFormat)
 	default:
 		return fmt.Errorf("unknown command: %s", rest[0])
 	}
@@ -476,6 +487,9 @@ func (a *App) runMetadata(configPath string, format OutputFormat) error {
 			"status",
 			"report",
 			"diff",
+			"drift",
+			"audit",
+			"context",
 			"size",
 			"search",
 			"export",
@@ -485,6 +499,8 @@ func (a *App) runMetadata(configPath string, format OutputFormat) error {
 			"backup push",
 			"backup status",
 			"backup pull",
+			"management sync",
+			"management status",
 			"sql",
 		},
 		"archive_tables": []string{
@@ -504,14 +520,19 @@ func (a *App) runMetadata(configPath string, format OutputFormat) error {
 			"data_copy_runs",
 			"search_docs",
 			"table_rows",
+			"management_snapshots",
 		},
 		"capabilities": []string{
 			"metadata-crawl",
+			"management-api-crawl",
 			"row-copy",
 			"storage-pull",
 			"encrypted-backup",
 			"auto-sync",
 			"archive-diff",
+			"branch-aware-drift",
+			"audit-pack",
+			"context-pack",
 			"fts-search",
 			"read-only-sql",
 			"json-output",
@@ -611,6 +632,159 @@ func (a *App) runDiff(ctx context.Context, configPath string, args []string, for
 	return a.writeOutput("diff", diff, format)
 }
 
+type driftReport struct {
+	Diff     store.DiffResult          `json:"diff"`
+	Audit    store.AuditReport         `json:"audit"`
+	Branches branchInventory           `json:"branches"`
+	Archive  *store.ManagementSnapshot `json:"management_snapshot,omitempty"`
+}
+
+type branchInventory struct {
+	Available  bool            `json:"available"`
+	ProjectRef string          `json:"project_ref,omitempty"`
+	Names      []string        `json:"names,omitempty"`
+	Warning    string          `json:"warning,omitempty"`
+	Raw        json.RawMessage `json:"raw,omitempty"`
+}
+
+func (a *App) runDrift(ctx context.Context, configPath string, args []string, format OutputFormat) error {
+	args, overrides, err := parseReadSyncArgs(args)
+	if err != nil {
+		return err
+	}
+	if len(args) != 1 {
+		return errors.New("usage: supacrawl drift <baseline-path> [--sync auto|always|never] [--stale-after duration]")
+	}
+	baselinePath, err := config.ExpandPath(args[0])
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if err := a.ensureFresh(ctx, cfg, mergeReadSyncOptions(defaultReadSyncOptions(cfg), overrides)); err != nil {
+		return err
+	}
+	current, err := store.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer current.Close()
+	baseline, err := store.OpenReadOnly(baselinePath)
+	if err != nil {
+		return err
+	}
+	defer baseline.Close()
+	diff, err := current.Diff(ctx, baseline)
+	if err != nil {
+		return err
+	}
+	audit, err := current.Audit(ctx, 10)
+	if err != nil {
+		return err
+	}
+	report := driftReport{Diff: diff, Audit: audit, Branches: branchInventory{Available: false, Warning: "no management snapshot; run `supacrawl management sync` for branch inventory"}}
+	if snapshot, err := current.LatestManagementSnapshot(ctx); err == nil {
+		report.Archive = &snapshot
+		report.Branches = extractBranchInventory(snapshot)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return a.writeOutput("Drift", report, format)
+}
+
+func (a *App) runAudit(ctx context.Context, configPath string, args []string, format OutputFormat) error {
+	args, overrides, err := parseReadSyncArgs(args)
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	limit := fs.Int("limit", 10, "maximum risk rows per section")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: supacrawl audit [--limit n] [--sync auto|always|never] [--stale-after duration]")
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if err := a.ensureFresh(ctx, cfg, mergeReadSyncOptions(defaultReadSyncOptions(cfg), overrides)); err != nil {
+		return err
+	}
+	st, err := store.OpenReadOnly(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	audit, err := st.Audit(ctx, *limit)
+	if err != nil {
+		return err
+	}
+	return a.writeOutput("Audit", audit, format)
+}
+
+func (a *App) runContextPack(ctx context.Context, configPath string, args []string, format OutputFormat) error {
+	args, overrides, err := parseReadSyncArgs(args)
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("context", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	limit := fs.Int("limit", 10, "maximum risk rows per section")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: supacrawl context [--limit n] [--sync auto|always|never] [--stale-after duration]")
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if err := a.ensureFresh(ctx, cfg, mergeReadSyncOptions(defaultReadSyncOptions(cfg), overrides)); err != nil {
+		return err
+	}
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	status, err := st.Status(ctx)
+	if err != nil {
+		return err
+	}
+	report, err := st.Report(ctx)
+	if err != nil {
+		return err
+	}
+	audit, err := st.Audit(ctx, *limit)
+	if err != nil {
+		return err
+	}
+	managementValue := map[string]any{"available": false}
+	if snapshot, err := st.LatestManagementSnapshot(ctx); err == nil {
+		managementValue = map[string]any{
+			"available": true,
+			"snapshot":  snapshot,
+			"branches":  extractBranchInventory(snapshot),
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return a.writeOutput("Context", map[string]any{
+		"tool":       "supacrawl",
+		"version":    Version,
+		"status":     status,
+		"report":     report,
+		"audit":      audit,
+		"management": managementValue,
+	}, format)
+}
+
 func (a *App) runSearch(ctx context.Context, configPath string, args []string, format OutputFormat) error {
 	args, overrides, err := parseReadSyncArgs(args)
 	if err != nil {
@@ -700,7 +874,7 @@ func (a *App) runSQL(ctx context.Context, configPath string, args []string, form
 	if err := a.ensureFresh(ctx, cfg, mergeReadSyncOptions(defaultReadSyncOptions(cfg), overrides)); err != nil {
 		return err
 	}
-	st, err := store.Open(cfg.DBPath)
+	st, err := store.OpenReadOnly(cfg.DBPath)
 	if err != nil {
 		return err
 	}
@@ -1119,6 +1293,180 @@ func (a *App) runBackupPull(ctx context.Context, configPath string, args []strin
 	}, format)
 }
 
+func (a *App) runManagement(ctx context.Context, configPath string, args []string, format OutputFormat) error {
+	if len(args) == 0 {
+		return errors.New("usage: supacrawl management <sync|status>")
+	}
+	switch args[0] {
+	case "sync":
+		return a.runManagementSync(ctx, configPath, args[1:], format)
+	case "status":
+		return a.runManagementStatus(ctx, configPath, args[1:], format)
+	default:
+		return fmt.Errorf("unknown management command: %s", args[0])
+	}
+}
+
+func (a *App) runManagementSync(ctx context.Context, configPath string, args []string, format OutputFormat) error {
+	fs := flag.NewFlagSet("management sync", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	projectRef := fs.String("project-ref", "", "Supabase project ref")
+	tokenEnv := fs.String("token-env", "SUPABASE_ACCESS_TOKEN", "environment variable containing a Supabase Management API access token")
+	apiURL := fs.String("api-url", "", "override Supabase Management API base URL")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: supacrawl management sync --project-ref <ref> [--token-env SUPABASE_ACCESS_TOKEN] [--api-url url]")
+	}
+	ref := strings.TrimSpace(*projectRef)
+	if ref == "" {
+		return errors.New("management sync requires --project-ref")
+	}
+	envName := strings.TrimSpace(*tokenEnv)
+	if envName == "" {
+		return errors.New("management sync requires --token-env")
+	}
+	token := strings.TrimSpace(os.Getenv(envName))
+	if token == "" {
+		return fmt.Errorf("management API token env %s is empty", envName)
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	client := management.NewClient(token)
+	if strings.TrimSpace(*apiURL) != "" {
+		client.BaseURL = strings.TrimSpace(*apiURL)
+	}
+	snapshot, err := client.CrawlProject(ctx, ref)
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	saved, err := st.PutManagementSnapshot(ctx, "management-api", ref, raw)
+	if err != nil {
+		return err
+	}
+	return a.writeOutput("Management Sync", map[string]any{
+		"project_ref":            ref,
+		"db_path":                cfg.DBPath,
+		"management_snapshot_id": saved.ID,
+		"collected_at":           saved.CollectedAt,
+		"snapshot":               snapshot,
+	}, format)
+}
+
+func (a *App) runManagementStatus(ctx context.Context, configPath string, args []string, format OutputFormat) error {
+	fs := flag.NewFlagSet("management status", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: supacrawl management status")
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	snapshot, err := st.LatestManagementSnapshot(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return a.writeOutput("Management Status", map[string]any{
+			"available": false,
+			"db_path":   cfg.DBPath,
+			"warning":   "no management snapshot; run `supacrawl management sync`",
+		}, format)
+	}
+	if err != nil {
+		return err
+	}
+	return a.writeOutput("Management Status", map[string]any{
+		"available": true,
+		"db_path":   cfg.DBPath,
+		"snapshot":  snapshot,
+		"branches":  extractBranchInventory(snapshot),
+	}, format)
+}
+
+func extractBranchInventory(snapshot store.ManagementSnapshot) branchInventory {
+	inventory := branchInventory{Available: false, ProjectRef: snapshot.ProjectRef}
+	var payload struct {
+		ProjectRef string `json:"project_ref"`
+		Branches   struct {
+			Available bool            `json:"available"`
+			Status    int             `json:"status"`
+			Raw       json.RawMessage `json:"raw"`
+		} `json:"branches"`
+	}
+	if err := json.Unmarshal(snapshot.RawJSON, &payload); err != nil {
+		inventory.Warning = "management snapshot raw_json could not be parsed for branch inventory"
+		return inventory
+	}
+	if strings.TrimSpace(payload.ProjectRef) != "" {
+		inventory.ProjectRef = payload.ProjectRef
+	}
+	inventory.Available = payload.Branches.Available
+	inventory.Raw = payload.Branches.Raw
+	if !payload.Branches.Available {
+		inventory.Warning = "branch inventory was not available in the latest management snapshot"
+		return inventory
+	}
+	inventory.Names = branchNamesFromRaw(payload.Branches.Raw)
+	if len(inventory.Names) == 0 {
+		inventory.Warning = "branch inventory was available, but no branch names were found"
+	}
+	return inventory
+}
+
+func branchNamesFromRaw(raw json.RawMessage) []string {
+	var values any
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil
+	}
+	names := map[string]struct{}{}
+	collectBranchNames(values, names)
+	out := make([]string, 0, len(names))
+	for name := range names {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func collectBranchNames(value any, names map[string]struct{}) {
+	switch v := value.(type) {
+	case []any:
+		for _, item := range v {
+			collectBranchNames(item, names)
+		}
+	case map[string]any:
+		for _, key := range []string{"name", "branch_name", "git_branch"} {
+			if name, ok := v[key].(string); ok && strings.TrimSpace(name) != "" {
+				names[strings.TrimSpace(name)] = struct{}{}
+			}
+		}
+		for _, key := range []string{"branches", "data", "items"} {
+			if nested, ok := v[key]; ok {
+				collectBranchNames(nested, names)
+			}
+		}
+	}
+}
+
 func loadConfig(path string) (config.Config, error) {
 	cfg, err := config.Load(path)
 	if err == nil {
@@ -1183,11 +1531,15 @@ Commands:
   status     print archive counts
   report     summarize schemas and policy coverage
   diff       compare current archive to another archive file
+  drift      compare archives plus audit and branch inventory
+  audit      print high-signal security and backup-readiness warnings
+  context    emit a compact context pack for humans or agents
   size       show local archive size breakdown
   search     search tables, functions, storage buckets, extensions
   export     export copied table rows as jsonl or csv
   storage    download Storage blobs from copied storage.objects rows
   backup     create and restore encrypted local archive snapshots
+  management crawl Supabase Management API metadata
   sql        run read-only SQL against the local archive
 
 Quick start:
@@ -1200,6 +1552,10 @@ Quick start:
   supacrawl sync --full --no-row-fts --exclude-table public.enrichments
   supacrawl status --sync auto --stale-after 15m
   supacrawl diff /path/to/older-archive.db --json
+  supacrawl audit --json
+  supacrawl context --json
+  supacrawl management sync --project-ref <ref> --token-env SUPABASE_ACCESS_TOKEN --json
+  supacrawl drift /path/to/older-archive.db --json
   supacrawl size
   supacrawl export --type jsonl --out companies.jsonl public.companies
   supacrawl storage pull --dir ./supabase-storage

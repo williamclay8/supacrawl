@@ -22,6 +22,10 @@ func renderText(w io.Writer, title string, value any) error {
 		renderReport(w, v)
 	case store.DiffResult:
 		renderDiff(w, v)
+	case driftReport:
+		renderDrift(w, v)
+	case store.AuditReport:
+		renderAudit(w, v)
 	case []store.SearchResult:
 		renderSearchResults(w, v)
 	case store.SQLResult:
@@ -82,8 +86,15 @@ func renderDiff(w io.Writer, diff store.DiffResult) {
 		fmt.Fprintf(w, "  warning: current and baseline archives are from different projects (current=%s, baseline=%s)\n", emptyUnknown(diff.Current.ProjectID), emptyUnknown(diff.Baseline.ProjectID))
 	}
 	renderTableDiff(w, diff.Tables)
+	renderDiffSummary(w, "columns", len(diff.Columns.Added), len(diff.Columns.Removed), len(diff.Columns.Changed))
+	renderDiffSummary(w, "indexes", len(diff.Indexes.Added), len(diff.Indexes.Removed), len(diff.Indexes.Changed))
+	renderDiffSummary(w, "constraints", len(diff.Constraints.Added), len(diff.Constraints.Removed), len(diff.Constraints.Changed))
 	renderPolicyDiff(w, diff.Policies)
+	renderDiffSummary(w, "functions", len(diff.Functions.Added), len(diff.Functions.Removed), len(diff.Functions.Changed))
+	renderDiffSummary(w, "triggers", len(diff.Triggers.Added), len(diff.Triggers.Removed), len(diff.Triggers.Changed))
+	renderDiffSummary(w, "extensions", len(diff.Extensions.Added), len(diff.Extensions.Removed), len(diff.Extensions.Changed))
 	renderStorageBucketDiff(w, diff.StorageBuckets)
+	renderDiffSummary(w, "table_rows", len(diff.TableRows.Added), len(diff.TableRows.Removed), len(diff.TableRows.Changed))
 }
 
 func renderTableDiff(w io.Writer, diff store.TableDiff) {
@@ -160,6 +171,66 @@ func renderStorageBucketDiff(w io.Writer, diff store.StorageBucketDiff) {
 		fmt.Fprintln(w, "    changed:")
 		for _, change := range diff.Changed {
 			fmt.Fprintf(w, "      ~ %s%s\n", change.Key, storageBucketChangeSummary(change))
+		}
+	}
+}
+
+func renderDiffSummary(w io.Writer, label string, added, removed, changed int) {
+	if added == 0 && removed == 0 && changed == 0 {
+		fmt.Fprintf(w, "\n  %s: no changes\n", label)
+		return
+	}
+	fmt.Fprintf(w, "\n  %s: +%d added, -%d removed, ~%d changed\n", label, added, removed, changed)
+}
+
+func renderDrift(w io.Writer, report driftReport) {
+	renderDiff(w, report.Diff)
+	fmt.Fprintln(w, "\n  audit")
+	renderAudit(w, report.Audit)
+	fmt.Fprintln(w, "\n  branches")
+	if report.Branches.Available {
+		if report.Branches.ProjectRef != "" {
+			fmt.Fprintf(w, "    project: %s\n", report.Branches.ProjectRef)
+		}
+		if len(report.Branches.Names) == 0 {
+			fmt.Fprintln(w, "    no branch names found")
+		} else {
+			for _, name := range report.Branches.Names {
+				fmt.Fprintf(w, "    - %s\n", name)
+			}
+		}
+	} else {
+		fmt.Fprintf(w, "    unavailable: %s\n", emptyUnknown(report.Branches.Warning))
+	}
+}
+
+func renderAudit(w io.Writer, audit store.AuditReport) {
+	fmt.Fprintf(w, "  tables without rls: %d\n", len(audit.TablesWithoutRLS))
+	for _, row := range audit.TablesWithoutRLS {
+		fmt.Fprintf(w, "    %s.%s (%s)\n", row.Schema, row.Table, row.Kind)
+	}
+	fmt.Fprintf(w, "  rls tables without policies: %d\n", len(audit.RLSTablesWithoutPolicies))
+	for _, row := range audit.RLSTablesWithoutPolicies {
+		fmt.Fprintf(w, "    %s.%s (%s)\n", row.Schema, row.Table, row.Kind)
+	}
+	fmt.Fprintf(w, "  public storage buckets: %d\n", len(audit.PublicStorageBuckets))
+	for _, row := range audit.PublicStorageBuckets {
+		fmt.Fprintf(w, "    %s (%s)\n", row.ID, row.Name)
+	}
+	fmt.Fprintf(w, "  security definer functions: %d\n", len(audit.SecurityDefinerFunctions))
+	for _, row := range audit.SecurityDefinerFunctions {
+		fmt.Fprintf(w, "    %s.%s(%s) [%s]\n", row.Schema, row.Name, row.IdentityArgs, row.Language)
+	}
+	if len(audit.LargeCopiedTables) > 0 {
+		fmt.Fprintln(w, "  largest copied tables")
+		for _, row := range audit.LargeCopiedTables {
+			fmt.Fprintf(w, "    %s.%s: %s across %d rows\n", row.Schema, row.Table, humanBytes(row.RowJSONBytes), row.Rows)
+		}
+	}
+	if len(audit.Warnings) > 0 {
+		fmt.Fprintln(w, "  warnings")
+		for _, warning := range audit.Warnings {
+			fmt.Fprintf(w, "    - %s\n", warning)
 		}
 	}
 }

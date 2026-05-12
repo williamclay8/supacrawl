@@ -43,8 +43,8 @@ Supported policy values are:
   URL is unavailable.
 - `never`: read only from the local SQLite archive.
 
-The same flags work on `status`, `report`, `search`, `sql`, `size`, and
-`export`:
+The same flags work on `status`, `report`, `diff`, `drift`, `audit`,
+`context`, `search`, `sql`, `size`, and `export`:
 
 ```bash
 supacrawl status --sync never

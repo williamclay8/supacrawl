@@ -17,6 +17,10 @@ policies, functions, Storage inventory, and copied table rows.
 - optional row-copy mode without FTS for smaller archives
 - local archive size reports
 - automatic metadata refresh for read commands, with opt-out flags
+- audit pack for RLS gaps, public buckets, security-definer functions, copied-data warnings, and Storage backup coverage
+- context pack output for agents and handoff notes
+- Supabase Management API snapshot crawl for project settings, branches, advisors, backups, secrets metadata, and Edge Function metadata
+- branch-aware drift reports that combine archive diffs, audit warnings, and branch inventory
 - per-table JSONL/CSV export from the local copy
 - Storage blob downloads from copied `storage.objects` rows
 - encrypted local backup shards with age
@@ -27,7 +31,6 @@ policies, functions, Storage inventory, and copied table rows.
 
 ## Not Yet Included
 
-- Supabase Management API crawl for edge functions, auth settings, branches, or secrets
 - git-backed archive publish/subscribe
 - terminal UI
 - Homebrew/release packaging
@@ -70,9 +73,13 @@ go run ./cmd/supacrawl sync --full
 go run ./cmd/supacrawl sync --full --no-row-fts
 go run ./cmd/supacrawl status
 go run ./cmd/supacrawl status --sync never
+go run ./cmd/supacrawl audit --json
+go run ./cmd/supacrawl context --json
 go run ./cmd/supacrawl size
 go run ./cmd/supacrawl search "auth policies"
 go run ./cmd/supacrawl diff ~/.supacrawl/supacrawl-before.db
+SUPABASE_ACCESS_TOKEN=sbp_... go run ./cmd/supacrawl management sync --project-ref <ref> --json
+go run ./cmd/supacrawl drift ~/.supacrawl/supacrawl-before.db --json
 go run ./cmd/supacrawl export --type jsonl --out companies.jsonl public.companies
 go run ./cmd/supacrawl storage pull --dir ./supabase-storage --limit 10
 go run ./cmd/supacrawl backup keygen --out ~/.supacrawl/age.key
@@ -96,6 +103,9 @@ If you build the binary, replace `go run ./cmd/supacrawl` with `./bin/supacrawl`
 - `status` prints archive counts
 - `report` summarizes schemas and policy coverage
 - `diff` compares the current archive to another archive file
+- `drift` compares archives and includes audit plus branch inventory when available
+- `audit` prints RLS, Storage, copied-data, and backup-readiness warnings
+- `context` emits a compact archive, audit, and management context pack
 - `size` reports archive file size and largest copied source tables
 - `search` searches crawled tables, functions, storage buckets, and extensions
 - `export` writes copied source rows for one table as JSONL or CSV
@@ -105,6 +115,8 @@ If you build the binary, replace `go run ./cmd/supacrawl` with `./bin/supacrawl`
 - `backup push` writes encrypted JSONL gzip shards plus a manifest
 - `backup status` prints backup manifest metadata
 - `backup pull` decrypts backup shards into a local restore directory
+- `management sync` stores a sanitized Supabase Management API snapshot
+- `management status` prints the latest Management API snapshot status
 - `sql` runs read-only SQL against the local SQLite archive
 
 ## Configuration
@@ -143,6 +155,17 @@ If `SUPABASE_SECRET_KEY` is not set, `supacrawl` will also try the legacy
 Supabase API keys are separate from the Postgres connection string. Use
 `SUPABASE_DB_URL` for metadata and row sync. Use `SUPABASE_SECRET_KEY` only for
 private Storage downloads.
+
+Management API crawling uses a Supabase personal access token. Keep it in the
+environment instead of config:
+
+```bash
+export SUPABASE_ACCESS_TOKEN="sbp_..."
+supacrawl management sync --project-ref <ref>
+```
+
+Secrets returned by the Management API are stored as metadata only; secret
+values are scrubbed before the snapshot is written to SQLite.
 
 ## Read Freshness
 
@@ -206,8 +229,46 @@ Compare the current archive against another SQLite archive file:
 supacrawl diff <other-archive.db>
 ```
 
-The first diff compares tables, policies, and Storage buckets, including RLS,
-policy expressions, and public bucket changes.
+Diff compares tables, columns, indexes, constraints, policies, functions,
+triggers, extensions, Storage buckets, and copied row counts.
+
+Use drift when you want the diff plus audit findings and branch inventory:
+
+```bash
+supacrawl drift <other-archive.db> --json
+```
+
+Branch inventory is populated by the latest Management API snapshot.
+
+## Audit And Context
+
+Audit prints high-signal local warnings:
+
+```bash
+supacrawl audit --json
+```
+
+The context pack bundles status, report, audit, and Management API snapshot
+metadata for handoffs:
+
+```bash
+supacrawl context --json
+```
+
+## Management API
+
+Management API crawling is read-only and stores a sanitized snapshot in
+`management_snapshots`:
+
+```bash
+export SUPABASE_ACCESS_TOKEN="sbp_..."
+supacrawl management sync --project-ref <ref> --json
+supacrawl management status --json
+```
+
+Unavailable Management API sections are kept as unavailable instead of failing
+the whole crawl when Supabase returns `404`. Authentication and rate-limit
+errors still fail fast.
 
 ## Export
 
@@ -266,6 +327,9 @@ supacrawl backup pull --out ./supacrawl-restore
 - `sync --full` prints per-table progress to stderr so JSON stdout stays parseable.
 - read commands default to a bounded auto-refresh policy and accept `--sync never`.
 - backups are encrypted local shards; private identities are read from env or disk.
+- backup pull verifies encrypted shard metadata, decrypted gzip, and plaintext hashes before writing restored shards.
+- Storage downloads reject absolute or traversal paths in bucket/object names.
+- `audit` warns when Storage object bytes or copied data require separate handling.
 - Secrets are resolved from environment variables and are not written into the archive by default.
 - Analysis happens against local SQLite through read-only `sql`.
 

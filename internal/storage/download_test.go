@@ -57,3 +57,20 @@ func TestObjectPathRejectsTraversal(t *testing.T) {
 	_, err := objectPath(t.TempDir(), store.StorageObject{BucketID: "pictures", Name: "../secret"})
 	require.Error(t, err)
 }
+
+func TestObjectPathRejectsAbsoluteBucketID(t *testing.T) {
+	_, err := objectPath(t.TempDir(), store.StorageObject{BucketID: "/pictures", Name: "avatars/a.png"})
+	require.Error(t, err)
+}
+
+func TestObjectPathRejectsBucketTraversal(t *testing.T) {
+	_, err := objectPath(t.TempDir(), store.StorageObject{BucketID: "pictures/../secret", Name: "avatars/a.png"})
+	require.Error(t, err)
+}
+
+func TestObjectPathKeepsValidPathsRootedInDirectory(t *testing.T) {
+	dir := t.TempDir()
+	localPath, err := objectPath(dir, store.StorageObject{BucketID: "pictures", Name: "avatars/a.png"})
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(dir, "pictures", "avatars", "a.png"), localPath)
+}

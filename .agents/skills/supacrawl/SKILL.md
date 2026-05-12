@@ -14,6 +14,13 @@ up a Supabase project into a local SQLite archive.
 - Use `sync` before `sync --full` on unfamiliar projects.
 - Use `storage pull --limit` before downloading a large bucket.
 - Use `status --sync never` when the user wants an archive-only read.
+- Use `audit --json` before claiming database backups cover every Supabase
+  surface; Storage blobs and copied rows need explicit handling.
+- Use `context --json` when handing off archive state to another agent.
+- Use `management sync --project-ref <ref>` only with a Supabase personal
+  access token from an environment variable.
+- Use `drift <older-archive.db> --json` when branch inventory or audit warnings
+  matter during comparison.
 - Use encrypted backups only with age recipients or identities supplied through
   config, files, or environment variables.
 
@@ -25,11 +32,20 @@ supacrawl doctor --json
 supacrawl sync --json
 supacrawl status --json
 supacrawl diff /path/to/older-archive.db --json
+supacrawl audit --json
+supacrawl context --json
 supacrawl size --json
 ```
 
 Use diff against a copy of the archive made before the sync you want to compare
 against.
+
+Use drift after a Management API sync when branches matter:
+
+```bash
+SUPABASE_ACCESS_TOKEN=sbp_... supacrawl management sync --project-ref <ref> --json
+supacrawl drift /path/to/older-archive.db --json
+```
 
 Read commands auto-refresh stale metadata by default. Override the policy when
 needed:
@@ -99,6 +115,7 @@ supacrawl sql "select json_extract(row_json, '$.name') from table_rows where sch
 - `data_copy_runs`
 - `search_docs`
 - `table_rows`
+- `management_snapshots`
 
 ## Validation
 

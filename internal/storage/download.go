@@ -195,11 +195,28 @@ func (d Downloader) objectURL(object store.StorageObject, authenticated bool) (s
 func objectPath(dir string, object store.StorageObject) (string, error) {
 	cleanBucket := filepath.Clean(object.BucketID)
 	cleanName := filepath.Clean(object.Name)
-	if cleanBucket == "." || cleanBucket == "" || strings.HasPrefix(cleanBucket, "..") {
+	if cleanBucket == "." || cleanBucket == "" || filepath.IsAbs(filepath.FromSlash(object.BucketID)) || strings.HasPrefix(cleanBucket, "..") || hasPathTraversalSegment(object.BucketID) {
 		return "", fmt.Errorf("invalid bucket id %q", object.BucketID)
 	}
-	if cleanName == "." || cleanName == "" || strings.HasPrefix(cleanName, "..") || filepath.IsAbs(cleanName) {
+	if cleanName == "." || cleanName == "" || strings.HasPrefix(cleanName, "..") || filepath.IsAbs(filepath.FromSlash(object.Name)) || hasPathTraversalSegment(object.Name) {
 		return "", fmt.Errorf("invalid object name %q", object.Name)
 	}
-	return filepath.Join(dir, cleanBucket, cleanName), nil
+	localPath := filepath.Join(dir, cleanBucket, cleanName)
+	rel, err := filepath.Rel(dir, localPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("invalid object path %q/%q", object.BucketID, object.Name)
+	}
+	return localPath, nil
+}
+
+func hasPathTraversalSegment(value string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(value), "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }

@@ -180,6 +180,9 @@ func (p Puller) Pull(ctx context.Context, outDir string) (PullResult, error) {
 			return PullResult{}, ctx.Err()
 		default:
 		}
+		if err := validateShard(shard); err != nil {
+			return PullResult{}, err
+		}
 		if err := p.pullShard(shard, outDir, identity); err != nil {
 			return PullResult{}, err
 		}
@@ -189,6 +192,9 @@ func (p Puller) Pull(ctx context.Context, outDir string) (PullResult, error) {
 }
 
 func (p Puller) pullShard(shard Shard, outDir string, identity age.Identity) error {
+	if err := validateShard(shard); err != nil {
+		return err
+	}
 	inputPath := filepath.Join(p.RepoPath, filepath.FromSlash(shard.File))
 	in, err := os.Open(inputPath)
 	if err != nil {
@@ -200,11 +206,92 @@ func (p Puller) pullShard(shard Shard, outDir string, identity age.Identity) err
 		return err
 	}
 	outPath := filepath.Join(outDir, shard.Table+".jsonl.gz")
-	out, err := os.Create(outPath)
+	tmp, err := os.CreateTemp(filepath.Dir(outPath), "."+filepath.Base(outPath)+".*.tmp")
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	_, err = io.Copy(out, decrypted)
-	return err
+	tmpPath := tmp.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := io.Copy(tmp, decrypted); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := verifyShardPlainSHA256(tmpPath, shard); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		return err
+	}
+	removeTmp = false
+	return nil
+}
+
+func validateShard(shard Shard) error {
+	if !isArchiveTable(shard.Table) {
+		return fmt.Errorf("unsupported archive table %q", shard.Table)
+	}
+	expectedFile := filepath.ToSlash(filepath.Join("shards", shard.Table+".jsonl.gz.age"))
+	if shard.File != expectedFile {
+		return fmt.Errorf("invalid shard file %q for table %q", shard.File, shard.Table)
+	}
+	cleanFile := filepath.Clean(filepath.FromSlash(shard.File))
+	if filepath.IsAbs(cleanFile) || cleanFile != filepath.FromSlash(expectedFile) || hasPathTraversal(cleanFile) {
+		return fmt.Errorf("invalid shard file %q for table %q", shard.File, shard.Table)
+	}
+	if _, err := hex.DecodeString(shard.PlainSHA256); err != nil || len(shard.PlainSHA256) != sha256.Size*2 {
+		return fmt.Errorf("invalid plain_sha256 for table %q", shard.Table)
+	}
+	return nil
+}
+
+func isArchiveTable(table string) bool {
+	for _, allowed := range store.ArchiveTableNames {
+		if table == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPathTraversal(path string) bool {
+	for _, part := range strings.Split(path, string(filepath.Separator)) {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func verifyShardPlainSHA256(gzipPath string, shard Shard) error {
+	in, err := os.Open(gzipPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	gz, err := gzip.NewReader(in)
+	if err != nil {
+		return fmt.Errorf("validate gzip for table %q: %w", shard.Table, err)
+	}
+	hash := sha256.New()
+	_, copyErr := io.Copy(hash, gz)
+	closeErr := gz.Close()
+	if copyErr != nil {
+		return fmt.Errorf("validate gzip for table %q: %w", shard.Table, copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("validate gzip for table %q: %w", shard.Table, closeErr)
+	}
+	actual := hex.EncodeToString(hash.Sum(nil))
+	if !strings.EqualFold(actual, shard.PlainSHA256) {
+		return fmt.Errorf("plain_sha256 mismatch for table %q", shard.Table)
+	}
+	return nil
 }

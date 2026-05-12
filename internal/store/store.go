@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -34,6 +35,7 @@ var ArchiveTableNames = []string{
 	"data_copy_runs",
 	"search_docs",
 	"table_rows",
+	"management_snapshots",
 }
 
 const schema = `
@@ -214,6 +216,14 @@ create table if not exists search_docs (
 
 create virtual table if not exists search_fts using fts5(doc_key unindexed, kind unindexed, title, body);
 
+create table if not exists management_snapshots (
+  id integer primary key autoincrement,
+  source_name text not null,
+  project_ref text not null,
+  collected_at text not null,
+  raw_json text not null
+);
+
 create index if not exists idx_tables_schema_kind on tables(schema_name, kind);
 create index if not exists idx_columns_table on columns(table_schema, table_name, ordinal);
 create index if not exists idx_policies_table on policies(schema_name, table_name);
@@ -303,6 +313,43 @@ type PolicyCount struct {
 	Schema   string `json:"schema"`
 	Table    string `json:"table"`
 	Policies int    `json:"policies"`
+}
+
+type AuditReport struct {
+	Status                   Status              `json:"status"`
+	TablesWithoutRLS         []RiskTable         `json:"tables_without_rls"`
+	RLSTablesWithoutPolicies []RiskTable         `json:"rls_tables_without_policies"`
+	PublicStorageBuckets     []RiskStorageBucket `json:"public_storage_buckets"`
+	SecurityDefinerFunctions []RiskFunction      `json:"security_definer_functions"`
+	LargeCopiedTables        []SourceTableSize   `json:"large_copied_tables"`
+	StorageObjectCount       int64               `json:"storage_object_count"`
+	Warnings                 []string            `json:"warnings"`
+}
+
+type RiskTable struct {
+	Schema string `json:"schema"`
+	Table  string `json:"table"`
+	Kind   string `json:"kind"`
+}
+
+type RiskStorageBucket struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type RiskFunction struct {
+	Schema       string `json:"schema"`
+	Name         string `json:"name"`
+	IdentityArgs string `json:"identity_args"`
+	Language     string `json:"language"`
+}
+
+type ManagementSnapshot struct {
+	ID          int64           `json:"id"`
+	SourceName  string          `json:"source_name"`
+	ProjectRef  string          `json:"project_ref"`
+	CollectedAt time.Time       `json:"collected_at"`
+	RawJSON     json.RawMessage `json:"raw_json"`
 }
 
 func Open(path string) (*Store, error) {
@@ -566,6 +613,184 @@ func (s *Store) Report(ctx context.Context) (Report, error) {
 		report.PolicyTables = append(report.PolicyTables, row)
 	}
 	return report, rows.Err()
+}
+
+func (s *Store) Audit(ctx context.Context, limit int) (AuditReport, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	status, err := s.Status(ctx)
+	if err != nil {
+		return AuditReport{}, err
+	}
+	audit := AuditReport{Status: status, StorageObjectCount: status.StorageObjects}
+
+	rows, err := s.db.QueryContext(ctx, `
+select schema_name, name, kind
+from tables
+where kind in ('table','partitioned_table','foreign_table')
+  and rls_enabled = 0
+  and schema_name not in ('auth','storage','realtime','graphql_public','vault','extensions')
+order by schema_name, name
+limit ?`, limit)
+	if err != nil {
+		return AuditReport{}, err
+	}
+	for rows.Next() {
+		var row RiskTable
+		if err := rows.Scan(&row.Schema, &row.Table, &row.Kind); err != nil {
+			rows.Close()
+			return AuditReport{}, err
+		}
+		audit.TablesWithoutRLS = append(audit.TablesWithoutRLS, row)
+	}
+	if err := rows.Close(); err != nil {
+		return AuditReport{}, err
+	}
+
+	rows, err = s.db.QueryContext(ctx, `
+select t.schema_name, t.name, t.kind
+from tables t
+left join policies p on p.schema_name = t.schema_name and p.table_name = t.name
+where t.kind in ('table','partitioned_table','foreign_table')
+  and t.rls_enabled = 1
+  and t.schema_name not in ('auth','storage','realtime','graphql_public','vault','extensions')
+group by t.schema_name, t.name, t.kind
+having count(p.name) = 0
+order by t.schema_name, t.name
+limit ?`, limit)
+	if err != nil {
+		return AuditReport{}, err
+	}
+	for rows.Next() {
+		var row RiskTable
+		if err := rows.Scan(&row.Schema, &row.Table, &row.Kind); err != nil {
+			rows.Close()
+			return AuditReport{}, err
+		}
+		audit.RLSTablesWithoutPolicies = append(audit.RLSTablesWithoutPolicies, row)
+	}
+	if err := rows.Close(); err != nil {
+		return AuditReport{}, err
+	}
+
+	rows, err = s.db.QueryContext(ctx, `
+select id, name
+from storage_buckets
+where public = 1
+order by id
+limit ?`, limit)
+	if err != nil {
+		return AuditReport{}, err
+	}
+	for rows.Next() {
+		var row RiskStorageBucket
+		if err := rows.Scan(&row.ID, &row.Name); err != nil {
+			rows.Close()
+			return AuditReport{}, err
+		}
+		audit.PublicStorageBuckets = append(audit.PublicStorageBuckets, row)
+	}
+	if err := rows.Close(); err != nil {
+		return AuditReport{}, err
+	}
+
+	rows, err = s.db.QueryContext(ctx, `
+select schema_name, name, identity_args, language
+from functions
+where security_definer = 1
+order by schema_name, name, identity_args
+limit ?`, limit)
+	if err != nil {
+		return AuditReport{}, err
+	}
+	for rows.Next() {
+		var row RiskFunction
+		if err := rows.Scan(&row.Schema, &row.Name, &row.IdentityArgs, &row.Language); err != nil {
+			rows.Close()
+			return AuditReport{}, err
+		}
+		audit.SecurityDefinerFunctions = append(audit.SecurityDefinerFunctions, row)
+	}
+	if err := rows.Close(); err != nil {
+		return AuditReport{}, err
+	}
+
+	size, err := s.Size(ctx, s.path, limit)
+	if err != nil {
+		return AuditReport{}, err
+	}
+	audit.LargeCopiedTables = size.SourceTables
+
+	if status.StorageObjects > 0 {
+		audit.Warnings = append(audit.Warnings, "Storage object bytes are not included in Supabase database backups; pair database backup checks with storage pull coverage.")
+	}
+	if status.DataRows > 0 {
+		audit.Warnings = append(audit.Warnings, "The local archive contains copied table rows; protect it like sensitive production data.")
+	}
+	if _, err := s.LatestManagementSnapshot(ctx); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			audit.Warnings = append(audit.Warnings, "Management API metadata has not been crawled; Edge Functions, branch, auth, and backup/PITR status may be missing.")
+		} else {
+			return AuditReport{}, err
+		}
+	}
+	return audit, nil
+}
+
+func (s *Store) PutManagementSnapshot(ctx context.Context, sourceName string, projectRef string, raw []byte) (ManagementSnapshot, error) {
+	raw = bytes.TrimSpace(raw)
+	if !json.Valid(raw) {
+		return ManagementSnapshot{}, errors.New("management snapshot raw_json is not valid JSON")
+	}
+	sourceName = strings.TrimSpace(sourceName)
+	if sourceName == "" {
+		sourceName = "management-api"
+	}
+	projectRef = strings.TrimSpace(projectRef)
+	if projectRef == "" {
+		return ManagementSnapshot{}, errors.New("management snapshot project_ref is required")
+	}
+	collectedAt := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, `
+insert into management_snapshots(source_name, project_ref, collected_at, raw_json)
+values(?,?,?,?)`, sourceName, projectRef, ts(collectedAt), string(raw))
+	if err != nil {
+		return ManagementSnapshot{}, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return ManagementSnapshot{}, err
+	}
+	return ManagementSnapshot{
+		ID:          id,
+		SourceName:  sourceName,
+		ProjectRef:  projectRef,
+		CollectedAt: collectedAt,
+		RawJSON:     append(json.RawMessage(nil), raw...),
+	}, nil
+}
+
+func (s *Store) LatestManagementSnapshot(ctx context.Context) (ManagementSnapshot, error) {
+	var snapshot ManagementSnapshot
+	var collectedAt string
+	var raw string
+	err := s.db.QueryRowContext(ctx, `
+select id, source_name, project_ref, collected_at, raw_json
+from management_snapshots
+order by id desc
+limit 1`).Scan(&snapshot.ID, &snapshot.SourceName, &snapshot.ProjectRef, &collectedAt, &raw)
+	if err != nil {
+		return ManagementSnapshot{}, err
+	}
+	if collectedAt != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, collectedAt)
+		if err == nil {
+			snapshot.CollectedAt = parsed
+		}
+	}
+	snapshot.RawJSON = json.RawMessage(raw)
+	return snapshot, nil
 }
 
 func (s *Store) Size(ctx context.Context, dbPath string, limit int) (ArchiveSize, error) {
@@ -925,5 +1150,26 @@ func isReadOnlyQuery(query string) bool {
 	lower := strings.ToLower(trimmed)
 	return strings.HasPrefix(lower, "select ") ||
 		strings.HasPrefix(lower, "with ") ||
-		strings.HasPrefix(lower, "pragma ")
+		isReadOnlyPragma(lower)
+}
+
+func isReadOnlyPragma(lower string) bool {
+	rest, ok := strings.CutPrefix(lower, "pragma ")
+	if !ok {
+		return false
+	}
+	rest = strings.TrimSpace(rest)
+	nameEnd := strings.IndexFunc(rest, func(r rune) bool {
+		return r != '_' && (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	})
+	if nameEnd >= 0 {
+		rest = rest[:nameEnd]
+	}
+
+	switch rest {
+	case "table_info", "table_list", "index_list", "database_list":
+		return true
+	default:
+		return false
+	}
 }
